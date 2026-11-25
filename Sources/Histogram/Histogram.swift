@@ -149,17 +149,9 @@ public struct Histogram<Count: FixedWidthInteger & Codable & Sendable>: Codable,
         self.highestTrackableValue = highestTrackableValue
         self.numberOfSignificantValueDigits = numberOfSignificantValueDigits
 
-        // Given a 3 decimal point accuracy, the expectation is obviously for "+/- 1 unit at 1000". It also means that
-        // it's "ok to be +/- 2 units at 2000". The "tricky" thing is that it is NOT ok to be +/- 2 units at 1999. Only
-        // starting at 2000. So internally, we need to maintain single unit resolution to 2x 10^decimalPoints.
-        let largestValueWithSingleUnitResolution = UInt64(2 * .pow(10.0, Int(numberOfSignificantValueDigits.rawValue)))
-
         unitMagnitude = UInt8(.log2(Double(lowestDiscernibleValue)))
 
-        // We need to maintain power-of-two subBucketCount (for clean direct indexing) that is large enough to
-        // provide unit resolution to at least largestValueWithSingleUnitResolution. So figure out
-        // largestValueWithSingleUnitResolution's nearest power-of-two (rounded up), and use that:
-        let subBucketCountMagnitude = UInt8((Double.log2(Double(largestValueWithSingleUnitResolution))).rounded(.up))
+        let subBucketCountMagnitude = Self.subBucketCountMagnitude(for: numberOfSignificantValueDigits)
         subBucketHalfCountMagnitude = (subBucketCountMagnitude > 1 ? subBucketCountMagnitude : 1) - 1
         let subBucketCount = 1 << subBucketCountMagnitude
         let subBucketHalfCount = subBucketCount / 2
@@ -1457,6 +1449,20 @@ public struct Histogram<Count: FixedWidthInteger & Codable & Sendable>: Codable,
     static func countsArrayLengthFor(bucketCount: Int, subBucketHalfCount: Int) -> Int {
         (bucketCount + 1) * subBucketHalfCount
     }
+
+    /**
+     * log2 of the sub-bucket count for a precision: the power of two (rounded up) that keeps single-unit resolution up to
+     * `2 * 10^digits`.
+     *
+     * Given a 3 decimal point accuracy, the expectation is obviously for "+/- 1 unit at 1000". It also means that it's
+     * "ok to be +/- 2 units at 2000". The "tricky" thing is that it is NOT ok to be +/- 2 units at 1999. Only starting at
+     * 2000. So internally, we need to maintain single unit resolution to 2x 10^decimalPoints, in a power-of-two
+     * subBucketCount (for clean direct indexing).
+     */
+    static func subBucketCountMagnitude(for digits: SignificantDigits) -> UInt8 {
+        let largestValueWithSingleUnitResolution = UInt64(2 * .pow(10.0, Int(digits.rawValue)))
+        return UInt8((Double.log2(Double(largestValueWithSingleUnitResolution))).rounded(.up))
+    }
 }
 
 // MARK: Histogram equality.
@@ -1498,6 +1504,173 @@ extension Histogram: Equatable {
         }
 
         return true
+    }
+}
+
+// MARK: Codable.
+
+/**
+ * `Codable` with the counts run-length encoded.
+ *
+ * The counts array has a slot for every value from 0 to ``highestTrackableValue`` at the configured precision (21,504
+ * slots for three significant digits up to 10^9), and most of them are usually zero: a histogram of a few hundred samples
+ * fills a few dozen. So `counts` is encoded as HdrHistogram's V2 encoding writes it before its LEB128 and DEFLATE stages:
+ * each non-zero count as itself, and each run of zero counts as one negative number, the run's length. A histogram of 10
+ * samples in 3 slots encodes its counts as something like `[-17775, 2, 7, 1, -3726]`.
+ *
+ * Decoding takes either form. A dense array (as written by versions before this one) is the case with no negative
+ * entries, so it decodes unchanged.
+ *
+ * The other properties are encoded as before, under the same keys. For output that's the same bytes every time (a
+ * baseline kept in version control), encode with `JSONEncoder.OutputFormatting.sortedKeys`: `JSONEncoder` doesn't keep
+ * the order keys are written in.
+ */
+public extension Histogram {
+    internal enum CodingKeys: String, CodingKey {
+        case lowestDiscernibleValue
+        case highestTrackableValue
+        case bucketCount
+        case subBucketMask
+        case maxValue
+        case minNonZeroValue
+        case counts
+        case _totalCount
+        case numberOfSignificantValueDigits
+        case autoResize
+        case subBucketHalfCountMagnitude
+        case leadingZeroCountBase
+        case unitMagnitude
+    }
+
+    /**
+     * Creates a histogram from its encoded form, with the counts run-length encoded or dense.
+     *
+     * - Parameters:
+     *   - decoder: The decoder to read from.
+     * - Throws: `DecodingError.dataCorrupted` if the layout's fields aren't ones the precision makes, the counts don't
+     *   fill exactly the slots the layout has, or a count is too large for `Count`; the decoder's errors for missing or
+     *   mistyped properties.
+     */
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        lowestDiscernibleValue = try container.decode(UInt64.self, forKey: .lowestDiscernibleValue)
+        highestTrackableValue = try container.decode(UInt64.self, forKey: .highestTrackableValue)
+        bucketCount = try container.decode(Int.self, forKey: .bucketCount)
+        subBucketMask = try container.decode(UInt64.self, forKey: .subBucketMask)
+        maxValue = try container.decode(UInt64.self, forKey: .maxValue)
+        minNonZeroValue = try container.decode(UInt64.self, forKey: .minNonZeroValue)
+        _totalCount = try container.decode(UInt64.self, forKey: ._totalCount)
+        numberOfSignificantValueDigits = try container.decode(SignificantDigits.self, forKey: .numberOfSignificantValueDigits)
+        autoResize = try container.decode(Bool.self, forKey: .autoResize)
+        subBucketHalfCountMagnitude = try container.decode(UInt8.self, forKey: .subBucketHalfCountMagnitude)
+        leadingZeroCountBase = try container.decode(UInt8.self, forKey: .leadingZeroCountBase)
+        unitMagnitude = try container.decode(UInt8.self, forKey: .unitMagnitude)
+
+        // The counts' length comes from the layout's fields, and run-length counts can expand to it from a few bytes:
+        // check the fields against what the precision makes (as `init` computes them), so a crafted file can't
+        // overflow the length or make it larger than a histogram of its precision has (at most 65 × 2^17 slots).
+        let subBucketCountMagnitude = Self.subBucketCountMagnitude(for: numberOfSignificantValueDigits)
+        guard subBucketHalfCountMagnitude == (subBucketCountMagnitude > 1 ? subBucketCountMagnitude : 1) - 1,
+              unitMagnitude <= 61 - subBucketHalfCountMagnitude,
+              (1 ... 64).contains(bucketCount)
+        else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .bucketCount,
+                in: container,
+                debugDescription: "A layout this precision can't have: bucketCount \(bucketCount), " +
+                    "subBucketHalfCountMagnitude \(subBucketHalfCountMagnitude), unitMagnitude \(unitMagnitude)"
+            )
+        }
+
+        let length = Self.countsArrayLengthFor(bucketCount: bucketCount, subBucketHalfCount: 1 << subBucketHalfCountMagnitude)
+        counts = try Self.decodeCounts(from: container, length: length)
+    }
+
+    /// The counts, run-length encoded or dense, expanded to `length` slots.
+    private static func decodeCounts(from container: KeyedDecodingContainer<CodingKeys>, length: Int) throws -> [Count] {
+        let encoded = try container.decode([Int64].self, forKey: .counts)
+        var counts: [Count] = []
+        counts.reserveCapacity(length)
+        for entry in encoded {
+            if entry < 0 {
+                // A run of zeros; refused before it's expanded if it runs past the array's length.
+                let run = entry.magnitude
+                guard run <= UInt64(length - counts.count) else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .counts,
+                        in: container,
+                        debugDescription: "A run of \(run) zero counts past the array's \(length)"
+                    )
+                }
+                counts.append(contentsOf: repeatElement(Count.zero, count: Int(run)))
+            } else {
+                guard counts.count < length, let count = Count(exactly: entry) else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .counts,
+                        in: container,
+                        debugDescription: "Count \(entry) out of range, or past the array's \(length) counts"
+                    )
+                }
+                counts.append(count)
+            }
+        }
+        guard counts.count == length else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .counts,
+                in: container,
+                debugDescription: "\(counts.count) counts, expected \(length)"
+            )
+        }
+        return counts
+    }
+
+    /**
+     * Encodes the histogram, with its counts run-length encoded: each non-zero count as itself, each run of zero counts
+     * as one negative number, the run's length.
+     *
+     * - Parameters:
+     *   - encoder: The encoder to write to.
+     * - Throws: `EncodingError.invalidValue` for a negative count or one beyond `Int64.max`; the encoder's errors.
+     */
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(lowestDiscernibleValue, forKey: .lowestDiscernibleValue)
+        try container.encode(highestTrackableValue, forKey: .highestTrackableValue)
+        try container.encode(bucketCount, forKey: .bucketCount)
+        try container.encode(subBucketMask, forKey: .subBucketMask)
+        try container.encode(maxValue, forKey: .maxValue)
+        try container.encode(minNonZeroValue, forKey: .minNonZeroValue)
+        try container.encode(_totalCount, forKey: ._totalCount)
+        try container.encode(numberOfSignificantValueDigits, forKey: .numberOfSignificantValueDigits)
+        try container.encode(autoResize, forKey: .autoResize)
+        try container.encode(subBucketHalfCountMagnitude, forKey: .subBucketHalfCountMagnitude)
+        try container.encode(leadingZeroCountBase, forKey: .leadingZeroCountBase)
+        try container.encode(unitMagnitude, forKey: .unitMagnitude)
+
+        var encoded: [Int64] = []
+        var zeros: Int64 = 0
+        for count in counts {
+            if count == 0 {
+                zeros += 1
+                continue
+            }
+            if zeros > 0 {
+                encoded.append(-zeros)
+                zeros = 0
+            }
+            // A negative count (a signed `Count`) would read back as a run of zeros.
+            guard count > 0, let value = Int64(exactly: count) else {
+                throw EncodingError.invalidValue(
+                    count,
+                    EncodingError.Context(codingPath: encoder.codingPath, debugDescription: "Count \(count) is negative or beyond Int64")
+                )
+            }
+            encoded.append(value)
+        }
+        if zeros > 0 {
+            encoded.append(-zeros)
+        }
+        try container.encode(encoded, forKey: .counts)
     }
 }
 
